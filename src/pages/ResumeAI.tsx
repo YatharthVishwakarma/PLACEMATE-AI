@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react';
-import { Upload, FileText, CheckCircle2, AlertCircle, XCircle, Zap, RotateCcw } from 'lucide-react';
+import { Upload, FileText, CheckCircle2, AlertCircle, XCircle, Zap, RotateCcw, Sparkles } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { storage } from '../lib/localStorage';
+import { askOpenAI } from '../lib/openai';
 
 interface AnalysisResult {
   score: number;
@@ -11,6 +12,15 @@ interface AnalysisResult {
   strengths: string[];
   improvements: string[];
   checklist: { item: string; passed: boolean }[];
+}
+
+interface AIResumeAnalysis {
+  score: number;
+  summary: string;
+  strengths: string[];
+  improvements: string[];
+  missingKeywords: string[];
+  atsChecklist: { item: string; passed: boolean }[];
 }
 
 const SAMPLE_RESUME = `Arjun Sharma
@@ -44,77 +54,47 @@ ACHIEVEMENTS
 - Smart India Hackathon 2025 finalist
 - Technical Head, Coding Club VIT`;
 
-function analyzeResume(text: string, targetRole: string): AnalysisResult {
-  const lower = text.toLowerCase();
-  const roleKeywords: Record<string, string[]> = {
-    'Software Developer': ['react', 'node', 'api', 'database', 'git', 'docker', 'agile', 'testing', 'algorithms', 'data structures'],
-    'Data Analyst': ['python', 'sql', 'pandas', 'tableau', 'excel', 'statistics', 'visualization', 'analysis', 'machine learning', 'reporting'],
-    'Frontend Developer': ['react', 'typescript', 'css', 'html', 'responsive', 'webpack', 'performance', 'accessibility', 'redux', 'testing'],
-    'Backend Developer': ['api', 'database', 'server', 'microservices', 'docker', 'kubernetes', 'sql', 'redis', 'authentication', 'scaling'],
-    'AI/ML Engineer': ['python', 'tensorflow', 'pytorch', 'scikit-learn', 'machine learning', 'neural', 'nlp', 'data pipeline', 'model', 'kaggle'],
+async function analyzeWithAI(text: string, targetRole: string): Promise<AIResumeAnalysis> {
+  const prompt = `Analyze this resume for a ${targetRole} position. Return ONLY a JSON object with this exact shape:
+{"score": number (0-100 overall resume quality for the target role), "summary": string (2-3 sentence honest overall assessment), "strengths": string[2-4], "improvements": string[2-4], "missingKeywords": string[0-6] (important keywords/skills for a ${targetRole} that are absent from this resume), "atsChecklist": [{"item": string, "passed": boolean}] (5-8 concrete ATS-friendliness checks like contact info present, quantified achievements, appropriate length, clear section headings)}
+
+Rules:
+- Evaluate like a constructive recruiter: content quality, impact, relevance to ${targetRole}, and ATS parseability.
+- Be specific — reference actual details from the resume, not generic advice.
+- If the resume is sparse or placeholder-like, say so honestly and score accordingly.`;
+
+  const raw = await askOpenAI([
+    { role: 'system', content: 'You are an expert technical recruiter and resume coach. Respond only with valid JSON.' },
+    { role: 'user', content: `Resume:\n\n${text.slice(0, 12000)}\n\n${prompt}` },
+  ], { json: true });
+
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const toStrArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
+  const checklist = Array.isArray(parsed.atsChecklist)
+    ? parsed.atsChecklist
+        .map((c) => c as Record<string, unknown>)
+        .filter((c) => typeof c.item === 'string')
+        .map((c) => ({ item: c.item as string, passed: c.passed === true }))
+    : [];
+  const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
+  if (typeof parsed.score !== 'number' || !summary) {
+    throw new Error('AI returned malformed analysis');
+  }
+  return {
+    score: Math.max(0, Math.min(100, Math.round(parsed.score))),
+    summary,
+    strengths: toStrArr(parsed.strengths),
+    improvements: toStrArr(parsed.improvements),
+    missingKeywords: toStrArr(parsed.missingKeywords),
+    atsChecklist: checklist,
   };
-
-  const requiredKeywords = roleKeywords[targetRole] ?? roleKeywords['Software Developer'];
-
-  const sections = [
-    { name: 'Contact Information', found: lower.includes('@') || lower.includes('email') || lower.includes('phone') || lower.includes('+91') },
-    { name: 'Education', found: lower.includes('education') || lower.includes('b.tech') || lower.includes('college') || lower.includes('university') },
-    { name: 'Experience', found: lower.includes('experience') || lower.includes('intern') || lower.includes('worked') },
-    { name: 'Projects', found: lower.includes('project') || lower.includes('built') || lower.includes('developed') },
-    { name: 'Skills', found: lower.includes('skill') || lower.includes('languages') || lower.includes('technologies') },
-    { name: 'Achievements / Awards', found: lower.includes('achievement') || lower.includes('award') || lower.includes('hackathon') || lower.includes('winner') },
-    { name: 'GitHub / LinkedIn', found: lower.includes('github') || lower.includes('linkedin') },
-    { name: 'Quantified Impact', found: /\d+%|\d+ users|\d+ projects|\d+ times/.test(lower) },
-  ];
-
-  const weakVerbsList = ['worked on', 'helped with', 'assisted', 'participated in', 'was responsible for', 'did'];
-  const weakVerbs = weakVerbsList.filter((v) => lower.includes(v));
-
-  const foundKeywords = requiredKeywords.filter((k) => lower.includes(k));
-  const missingKeywords = requiredKeywords.filter((k) => !lower.includes(k)).slice(0, 5);
-
-  const foundSections = sections.filter((s) => s.found).length;
-  const keywordScore = Math.round((foundKeywords.length / requiredKeywords.length) * 30);
-  const sectionScore = Math.round((foundSections / sections.length) * 40);
-  const verbPenalty = weakVerbs.length * 3;
-  const lengthBonus = text.length > 500 ? 10 : 5;
-  const impactBonus = /\d+%/.test(lower) ? 10 : 5;
-  const score = Math.min(100, keywordScore + sectionScore + lengthBonus + impactBonus - verbPenalty + 5);
-
-  const strengths: string[] = [];
-  if (lower.includes('github')) strengths.push('GitHub profile linked — shows active development');
-  if (/\d+%/.test(lower)) strengths.push('Quantified impact with metrics (great for ATS)');
-  if (lower.includes('intern')) strengths.push('Internship experience is a strong differentiator');
-  if (lower.includes('hackathon')) strengths.push('Hackathon participation demonstrates initiative');
-  if (foundKeywords.length >= 6) strengths.push(`Strong keyword alignment for ${targetRole} role`);
-
-  const improvements: string[] = [];
-  if (weakVerbs.length > 0) improvements.push(`Replace weak verbs (${weakVerbs.slice(0, 2).join(', ')}) with strong action verbs like "Architected", "Optimized", "Engineered"`);
-  if (missingKeywords.length > 0) improvements.push(`Add missing keywords for ${targetRole}: ${missingKeywords.join(', ')}`);
-  if (!lower.includes('summary') && !lower.includes('objective')) improvements.push('Add a concise 2-line professional summary at the top');
-  if (!sections.find((s) => s.name === 'Achievements / Awards')?.found) improvements.push('Add an Achievements section — certifications, rankings, or awards');
-  if (!sections.find((s) => s.name === 'Quantified Impact')?.found) improvements.push('Quantify your impact: "Increased performance by X%", "Handled Y users"');
-
-  const checklist = [
-    { item: 'Contact info visible and complete', passed: sections[0].found },
-    { item: 'Education section present', passed: sections[1].found },
-    { item: 'Work/Internship experience listed', passed: sections[2].found },
-    { item: 'Projects section with descriptions', passed: sections[3].found },
-    { item: 'Technical skills section', passed: sections[4].found },
-    { item: 'Quantified achievements (numbers/percentages)', passed: sections[7].found },
-    { item: 'GitHub or portfolio link included', passed: sections[6].found },
-    { item: 'No weak action verbs detected', passed: weakVerbs.length === 0 },
-    { item: `Key ${targetRole} keywords present`, passed: foundKeywords.length >= 5 },
-    { item: 'ATS-friendly formatting (no tables/images)', passed: true },
-  ];
-
-  return { score, sections, missingKeywords, weakVerbs, strengths, improvements, checklist };
 }
 
 export default function ResumeAI() {
   const [resumeText, setResumeText] = useState('');
   const [targetRole, setTargetRole] = useState('Software Developer');
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [result, setResult] = useState<AIResumeAnalysis | null>(null);
   const [loading, setLoading] = useState(false);
   const [fileName, setFileName] = useState('');
   const [error, setError] = useState('');
@@ -148,17 +128,20 @@ export default function ResumeAI() {
     if (file) handleFile(file);
   };
 
-  const handleAnalyze = () => {
+  const handleAnalyze = async () => {
     const textToAnalyze = resumeText.startsWith('[PDF') ? SAMPLE_RESUME : resumeText;
     if (!textToAnalyze.trim()) { setError('Please upload a resume or load the sample.'); return; }
     setLoading(true);
     setError('');
-    setTimeout(() => {
-      const res = analyzeResume(textToAnalyze, targetRole);
+    try {
+      const res = await analyzeWithAI(textToAnalyze, targetRole);
       setResult(res);
       storage.addActivity({ id: Date.now().toString(), type: 'resume', description: `Resume analyzed for ${targetRole} — score ${res.score}/100`, timestamp: new Date().toISOString(), xp: 15 });
+    } catch {
+      setError('AI analysis is unavailable right now. Please try again in a moment.');
+    } finally {
       setLoading(false);
-    }, 1200);
+    }
   };
 
   const scoreColor = result
@@ -172,11 +155,12 @@ export default function ResumeAI() {
           <FileText className="w-5 h-5 text-violet-400" />
           <h1 className="text-xl font-bold text-white">Resume AI Analyzer</h1>
         </div>
-        <p className="text-slate-400 text-sm">Get instant, actionable feedback on your resume using automated analysis.</p>
+        <p className="text-slate-400 text-sm">Get instant, personalized feedback on your resume from OpenAI.</p>
       </div>
 
-      <div className="bg-blue-500/5 border border-blue-500/15 rounded-xl px-4 py-3 text-xs text-slate-500">
-        This analyzer uses rule-based checks (keywords, section detection, verb quality) — not a live AI model. Results reflect automated pattern matching, not a recruiter's assessment.
+      <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl px-4 py-3 text-xs text-slate-500 flex items-start gap-2">
+        <Sparkles className="w-3.5 h-3.5 text-violet-400 flex-shrink-0 mt-0.5" />
+        <span>Analysis is powered by OpenAI and reflects an AI-generated evaluation — helpful for practice, not a substitute for a professional recruiter's review.</span>
       </div>
 
       <div className="grid lg:grid-cols-2 gap-5">
@@ -298,20 +282,30 @@ export default function ResumeAI() {
                 </div>
               </div>
 
-              {/* Checklist */}
-              <div className="bg-[#141B31] border border-white/5 rounded-2xl p-5">
-                <h3 className="text-white font-semibold text-sm mb-3">Resume Checklist</h3>
-                <div className="space-y-2">
-                  {result.checklist.map(({ item, passed }) => (
-                    <div key={item} className="flex items-center gap-2">
-                      {passed
-                        ? <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-                        : <XCircle className="w-4 h-4 text-red-400 flex-shrink-0" />}
-                      <span className={cn('text-xs', passed ? 'text-slate-300' : 'text-slate-500')}>{item}</span>
-                    </div>
-                  ))}
-                </div>
+              {/* Summary */}
+              <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl p-4">
+                <h3 className="text-violet-400 font-semibold text-sm mb-2 flex items-center gap-1.5">
+                  <Sparkles className="w-4 h-4" /> AI Assessment
+                </h3>
+                <p className="text-sm text-slate-300 leading-relaxed">{result.summary}</p>
               </div>
+
+              {/* Checklist */}
+              {result.atsChecklist.length > 0 && (
+                <div className="bg-[#141B31] border border-white/5 rounded-2xl p-5">
+                  <h3 className="text-white font-semibold text-sm mb-3">ATS Readiness Checklist</h3>
+                  <div className="space-y-2">
+                    {result.atsChecklist.map(({ item, passed }) => (
+                      <div key={item} className="flex items-center gap-2">
+                        {passed
+                          ? <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                          : <XCircle className="w-4 h-4 text-red-400 flex-shrink-0" />}
+                        <span className={cn('text-xs', passed ? 'text-slate-300' : 'text-slate-500')}>{item}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Strengths */}
               {result.strengths.length > 0 && (

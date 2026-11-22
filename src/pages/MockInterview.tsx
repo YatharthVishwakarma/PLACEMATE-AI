@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Mic2, ChevronRight, ChevronLeft, CheckCircle2, RotateCcw, Play, Award } from 'lucide-react';
+import { Mic2, ChevronRight, ChevronLeft, CheckCircle2, RotateCcw, Play, Award, Sparkles, Bot, AlertCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { storage } from '../lib/localStorage';
+import { askOpenAI } from '../lib/openai';
 
 interface Question {
   id: string;
@@ -74,6 +75,114 @@ interface Answer {
   questionId: string;
   answer: string;
   reviewed: boolean;
+  feedback?: AIFeedback;
+}
+
+interface AIFeedback {
+  score: number;
+  strengths: string[];
+  improvements: string[];
+  modelAnswer: string;
+}
+
+const FALLBACK_QUESTIONS: Question[] = [
+  { id: 'fb-1', question: 'What is the difference between an array and a linked list?', hints: ['Think about memory allocation', 'Consider access time'], sampleAnswer: 'Arrays store elements in contiguous memory, allowing O(1) random access. Linked lists store elements as nodes with pointers, offering O(1) insertion/deletion at head but O(n) access. Arrays are better for indexed access; linked lists for frequent insertions/deletions.', concepts: ['Memory allocation', 'Time complexity', 'Data structures'] },
+  { id: 'fb-2', question: 'Tell me about yourself.', hints: ['Present-Past-Future format', '2 minutes max', 'Relevant to the role'], sampleAnswer: 'Start with your current status, then cover relevant past experiences (internship, projects). End with why you\'re excited about this opportunity. Keep it to 90 seconds, focused, and confident.', concepts: ['Self-presentation', 'Confidence', 'Clarity'] },
+  { id: 'fb-3', question: 'Describe a challenging project you worked on and how you overcame the obstacles.', hints: ['Choose genuinely complex', 'Highlight your specific role', 'Multiple obstacles'], sampleAnswer: 'Pick your strongest project. Structure: 1) What made it hard (technical + team challenges), 2) Specific actions you took (not "we"), 3) Quantified outcomes. Shows problem-solving depth and ownership.', concepts: ['Problem-solving', 'Ownership', 'Technical depth'] },
+];
+
+async function generateAIQuestions(cfg: SessionConfig): Promise<Question[]> {
+  const prompt = `You are a technical interviewer preparing a candidate for a ${cfg.role} position. Generate exactly ${cfg.count} interview questions for a ${cfg.difficulty} difficulty ${cfg.type} interview.
+
+Return ONLY a JSON object with this exact shape:
+{"questions": [{"question": string, "hints": string[2], "sampleAnswer": string, "concepts": string[3]}]}
+
+Rules:
+- Each "question" is a single interview question tailored to the role and difficulty.
+- Each "hints" array has exactly 2 short pointers the candidate can consider.
+- "sampleAnswer" is a strong model answer, 2-4 sentences.
+- "concepts" lists exactly 3 key concepts a good answer should mention.
+- Vary the questions; do not repeat topics.`;
+
+  const raw = await askOpenAI([
+    { role: 'system', content: 'You are an expert interview coach. Respond only with valid JSON.' },
+    { role: 'user', content: prompt },
+  ], { json: true });
+
+  const parsed = JSON.parse(raw) as { questions?: unknown };
+  if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) {
+    throw new Error('AI returned no questions');
+  }
+
+  return parsed.questions.slice(0, cfg.count).map((q, i) => {
+    const obj = q as Record<string, unknown>;
+    const hints = Array.isArray(obj.hints) ? obj.hints.filter((h): h is string => typeof h === 'string') : [];
+    const concepts = Array.isArray(obj.concepts) ? obj.concepts.filter((c): c is string => typeof c === 'string') : [];
+    if (typeof obj.question !== 'string' || typeof obj.sampleAnswer !== 'string') {
+      throw new Error('AI returned malformed questions');
+    }
+    return {
+      id: `ai-${Date.now()}-${i}`,
+      question: obj.question,
+      hints,
+      sampleAnswer: obj.sampleAnswer,
+      concepts,
+    };
+  });
+}
+
+async function reviewAnswer(cfg: SessionConfig, question: string, answer: string): Promise<AIFeedback> {
+  const prompt = `A candidate interviewing for a ${cfg.role} position (${cfg.type} interview, ${cfg.difficulty} difficulty) was asked:
+
+"${question}"
+
+They answered:
+"${answer}"
+
+Evaluate their answer and return ONLY a JSON object with this exact shape:
+{"score": number (0-100), "strengths": string[2-3], "improvements": string[1-3], "modelAnswer": string}
+
+Rules:
+- "score" reflects quality: completeness, correctness, structure, relevance.
+- "strengths" are specific things they did well (be encouraging but honest; empty answers score 0).
+- "improvements" are concrete, actionable suggestions.
+- "modelAnswer" is a strong 2-4 sentence model answer to this exact question.`;
+
+  const raw = await askOpenAI([
+    { role: 'system', content: 'You are a supportive but rigorous interview coach. Respond only with valid JSON.' },
+    { role: 'user', content: prompt },
+  ], { json: true });
+
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const toStrArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
+  const modelAnswer = typeof parsed.modelAnswer === 'string' ? parsed.modelAnswer : '';
+  const score = typeof parsed.score === 'number' ? Math.max(0, Math.min(100, Math.round(parsed.score))) : 0;
+  const strengths = toStrArr(parsed.strengths);
+  const improvements = toStrArr(parsed.improvements);
+  if (!modelAnswer && strengths.length === 0 && improvements.length === 0) {
+    throw new Error('AI returned malformed feedback');
+  }
+  return { score, strengths, improvements, modelAnswer };
+}
+
+async function summarizeSession(cfg: SessionConfig, qa: { question: string; answer: string; score: number }[]): Promise<{ overall: number; summary: string; tips: string[] }> {
+  const transcript = qa.map((x, i) => `Q${i + 1}: ${x.question}\nA: ${x.answer || '(no answer)'} (score: ${x.score})`).join('\n\n');
+  const prompt = `A candidate just finished a ${cfg.type} mock interview for a ${cfg.role} role at ${cfg.difficulty} difficulty. Here is the transcript with per-answer scores:\n\n${transcript}\n\nReturn ONLY a JSON object with this exact shape:\n{"overall": number (0-100 overall interview score), "summary": string (2-3 sentence honest assessment), "tips": string[3-4] (specific improvement tips for the next session)}`;
+
+  const raw = await askOpenAI([
+    { role: 'system', content: 'You are an honest interview coach writing a session debrief. Respond only with valid JSON.' },
+    { role: 'user', content: prompt },
+  ], { json: true });
+
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const tips = Array.isArray(parsed.tips) ? parsed.tips.filter((t): t is string => typeof t === 'string') : [];
+  const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
+  const overall = typeof parsed.overall === 'number' ? Math.max(0, Math.min(100, Math.round(parsed.overall))) : 0;
+  if (!summary && tips.length === 0) {
+    throw new Error('AI returned malformed summary');
+  }
+  return { overall, summary, tips };
 }
 
 export default function MockInterview() {
@@ -84,27 +193,52 @@ export default function MockInterview() {
   const [answers, setAnswers] = useState<Record<string, Answer>>({});
   const [showAnswer, setShowAnswer] = useState(false);
   const [currentAnswer, setCurrentAnswer] = useState('');
+  const [aiError, setAiError] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [summary, setSummary] = useState<{ overall: number; summary: string; tips: string[] } | null>(null);
 
   const roles = ['Software Developer', 'Data Analyst', 'AI/ML Engineer', 'Frontend Developer', 'Backend Developer'];
   const types = ['Technical', 'HR', 'Behavioral', 'DSA'];
   const difficulties = ['Easy', 'Medium', 'Hard'];
 
-  const startSession = () => {
-    const pool = questionBank[config.type]?.[config.difficulty] ?? questionBank.Technical.Medium;
-    const shuffled = [...pool].sort(() => Math.random() - 0.5);
-    const selected = shuffled.slice(0, Math.min(config.count, pool.length));
-    setQuestions(selected.length > 0 ? selected : questionBank.Technical.Easy);
+  const startSession = async () => {
+    setGenerating(true);
+    setAiError('');
+    try {
+      const aiQuestions = await generateAIQuestions(config);
+      setQuestions(aiQuestions);
+    } catch {
+      const pool = questionBank[config.type]?.[config.difficulty] ?? questionBank.Technical.Medium;
+      const shuffled = [...pool].sort(() => Math.random() - 0.5);
+      const selected = shuffled.slice(0, Math.min(config.count, pool.length));
+      setQuestions(selected.length > 0 ? selected : FALLBACK_QUESTIONS);
+      setAiError('AI is unavailable right now — using built-in practice questions instead.');
+    } finally {
+      setGenerating(false);
+    }
     setAnswers({});
     setCurrentIdx(0);
     setCurrentAnswer('');
     setShowAnswer(false);
+    setSummary(null);
     setPhase('session');
   };
 
-  const submitAnswer = () => {
+  const submitAnswer = async () => {
     const q = questions[currentIdx];
     setAnswers((prev) => ({ ...prev, [q.id]: { questionId: q.id, answer: currentAnswer, reviewed: false } }));
     setShowAnswer(true);
+    setReviewing(true);
+    try {
+      const feedback = await reviewAnswer(config, q.question, currentAnswer);
+      setAnswers((prev) => ({ ...prev, [q.id]: { ...prev[q.id], questionId: q.id, answer: currentAnswer, reviewed: true, feedback } }));
+    } catch {
+      setAiError('AI feedback is unavailable right now — showing the model answer instead.');
+      setAnswers((prev) => ({ ...prev, [q.id]: { ...prev[q.id], questionId: q.id, answer: currentAnswer, reviewed: true } }));
+    } finally {
+      setReviewing(false);
+    }
   };
 
   const nextQuestion = () => {
@@ -119,8 +253,25 @@ export default function MockInterview() {
     }
   };
 
-  const finishSession = () => {
+  const finishSession = async () => {
     const attempted = Object.values(answers).filter((a) => a.answer.trim()).length;
+    const answeredQA = questions.map((q) => ({
+      question: q.question,
+      answer: answers[q.id]?.answer ?? '',
+      score: answers[q.id]?.feedback?.score ?? 0,
+    })).filter((qa) => qa.answer.trim());
+
+    let overallScore = Math.round((attempted / questions.length) * 100);
+    setSummary(null);
+    setPhase('summary');
+    try {
+      const result = await summarizeSession(config, answeredQA);
+      setSummary(result);
+      overallScore = result.overall;
+    } catch {
+      setAiError('AI session summary is unavailable right now.');
+    }
+
     storage.addInterview({
       id: Date.now().toString(),
       role: config.role,
@@ -129,7 +280,7 @@ export default function MockInterview() {
       questionsAttempted: attempted,
       totalQuestions: questions.length,
       date: new Date().toISOString(),
-      score: Math.round((attempted / questions.length) * 100),
+      score: overallScore,
     });
     storage.addActivity({
       id: Date.now().toString(),
@@ -138,7 +289,6 @@ export default function MockInterview() {
       timestamp: new Date().toISOString(),
       xp: 30,
     });
-    setPhase('summary');
   };
 
   if (phase === 'config') {
@@ -149,12 +299,17 @@ export default function MockInterview() {
             <Mic2 className="w-5 h-5 text-violet-400" />
             <h1 className="text-xl font-bold text-white">Mock Interview Studio</h1>
           </div>
-          <p className="text-slate-400 text-sm">Practice with structured questions and get feedback on your answers.</p>
+          <p className="text-slate-400 text-sm">Practice with AI-generated questions and get personalized feedback on your answers.</p>
         </div>
 
-        <div className="bg-blue-500/5 border border-blue-500/15 rounded-xl px-4 py-3 text-xs text-slate-500">
-          Feedback is automated practice guidance based on predefined answer frameworks — not a professional recruiter evaluation.
+        <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl px-4 py-3 text-xs text-slate-500 flex items-start gap-2">
+          <Sparkles className="w-3.5 h-3.5 text-violet-400 flex-shrink-0 mt-0.5" />
+          <span>Questions are generated live by OpenAI and feedback is an automated practice evaluation — not a professional recruiter assessment.</span>
         </div>
+
+        {aiError && (
+          <div className="bg-orange-500/5 border border-orange-500/15 rounded-xl px-4 py-3 text-xs text-orange-300">{aiError}</div>
+        )}
 
         <div className="bg-[#141B31] border border-white/5 rounded-2xl p-6 space-y-5">
           <div>
@@ -209,10 +364,19 @@ export default function MockInterview() {
             </div>
           </div>
 
-          <button onClick={startSession}
-            className="w-full py-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white font-semibold text-sm transition-colors flex items-center justify-center gap-2">
-            <Play className="w-4 h-4" />
-            Start Interview Session
+          <button onClick={startSession} disabled={generating}
+            className="w-full py-3 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm transition-colors flex items-center justify-center gap-2">
+            {generating ? (
+              <>
+                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                Generating your interview with AI...
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4" />
+                Start Interview Session
+              </>
+            )}
           </button>
         </div>
 
@@ -304,12 +468,66 @@ export default function MockInterview() {
                 </div>
               )}
 
-              <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl p-4">
-                <p className="text-xs font-medium text-violet-400 mb-2 flex items-center gap-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> Model Answer & Framework
-                </p>
-                <p className="text-sm text-slate-300 leading-relaxed">{q.sampleAnswer}</p>
-              </div>
+              {reviewing && (
+                <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl p-4 flex items-center gap-3">
+                  <div className="w-5 h-5 border-2 border-violet-500/30 border-t-violet-500 rounded-full animate-spin flex-shrink-0" />
+                  <p className="text-sm text-violet-300">AI coach is reviewing your answer...</p>
+                </div>
+              )}
+
+              {!reviewing && answers[q.id]?.feedback && (
+                <div className="space-y-4">
+                  <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-xs font-medium text-violet-400 flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5" /> AI Feedback
+                      </p>
+                      <span className={cn('text-lg font-bold',
+                        (answers[q.id].feedback?.score ?? 0) >= 70 ? 'text-emerald-400' : (answers[q.id].feedback?.score ?? 0) >= 40 ? 'text-yellow-400' : 'text-red-400')}>
+                        {answers[q.id].feedback?.score ?? 0}/100
+                      </span>
+                    </div>
+                    {answers[q.id].feedback!.strengths.length > 0 && (
+                      <div className="mb-3">
+                        <p className="text-xs font-medium text-emerald-400 mb-1">What went well</p>
+                        <ul className="space-y-1">
+                          {answers[q.id].feedback!.strengths.map((s) => (
+                            <li key={s} className="text-xs text-slate-400 flex items-start gap-1.5">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0 mt-0.5" /> {s}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {answers[q.id].feedback!.improvements.length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-orange-400 mb-1">To improve</p>
+                        <ul className="space-y-1">
+                          {answers[q.id].feedback!.improvements.map((s) => (
+                            <li key={s} className="text-xs text-slate-400 flex items-start gap-1.5">
+                              <AlertCircle className="w-3 h-3 text-orange-400 flex-shrink-0 mt-0.5" /> {s}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-white/3 border border-white/8 rounded-xl p-4">
+                    <p className="text-xs font-medium text-slate-400 mb-2">Model Answer</p>
+                    <p className="text-sm text-slate-300 leading-relaxed">{answers[q.id].feedback!.modelAnswer || q.sampleAnswer}</p>
+                  </div>
+                </div>
+              )}
+
+              {!reviewing && !answers[q.id]?.feedback && (
+                <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl p-4">
+                  <p className="text-xs font-medium text-violet-400 mb-2 flex items-center gap-1.5">
+                    <Bot className="w-3.5 h-3.5" /> Model Answer & Framework
+                  </p>
+                  <p className="text-sm text-slate-300 leading-relaxed">{q.sampleAnswer}</p>
+                </div>
+              )}
 
               <div className="bg-white/2 border border-white/5 rounded-xl p-3">
                 <p className="text-xs font-medium text-slate-400 mb-2">Key Concepts to Mention:</p>
@@ -364,18 +582,34 @@ export default function MockInterview() {
           ))}
         </div>
         <div className="text-left space-y-2 mb-6">
-          <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Improvement Tips</p>
-          {[
-            'Structure answers using STAR method for behavioral questions',
-            'Always state your approach before coding in DSA questions',
-            'Quantify achievements with numbers wherever possible',
-            'Conclude with time/space complexity in technical questions',
-          ].map((tip) => (
-            <div key={tip} className="flex items-start gap-2">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
-              <p className="text-xs text-slate-400">{tip}</p>
+          <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">AI Coach Summary</p>
+          {summary ? (
+            <>
+              <div className="bg-violet-500/5 border border-violet-500/15 rounded-xl p-4 mb-3">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-medium text-violet-400 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5" /> Overall Score
+                  </p>
+                  <span className={cn('text-xl font-bold',
+                    summary.overall >= 70 ? 'text-emerald-400' : summary.overall >= 40 ? 'text-yellow-400' : 'text-red-400')}>
+                    {summary.overall}/100
+                  </span>
+                </div>
+                <p className="text-sm text-slate-300 leading-relaxed">{summary.summary}</p>
+              </div>
+              {summary.tips.map((tip) => (
+                <div key={tip} className="flex items-start gap-2">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-xs text-slate-400">{tip}</p>
+                </div>
+              ))}
+            </>
+          ) : (
+            <div className="flex items-center gap-2 py-2">
+              <div className="w-4 h-4 border-2 border-violet-500/30 border-t-violet-500 rounded-full animate-spin" />
+              <p className="text-xs text-slate-500">AI coach is preparing your session debrief...</p>
             </div>
-          ))}
+          )}
         </div>
         <div className="flex gap-3">
           <button onClick={() => { setPhase('config'); setQuestions([]); }}

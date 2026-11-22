@@ -1,0 +1,9 @@
+{
+  "projectId": "71949431",
+  "functions": {
+    "openai-chat": {
+      "hasChanged": false,
+      "hash": "3cb59db07d5ce365fdf3271ecc6b9b61a154ccbfe9428fbfee486ca6c656b7e1"
+    }
+  }
+}
